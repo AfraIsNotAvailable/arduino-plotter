@@ -1,5 +1,2 @@
-.pio
-.vscode/.browse.c_cpp.db*
-.vscode/c_cpp_properties.json
-.vscode/launch.json
-.vscode/ipch
+# Created by venv; see https://docs.python.org/3/library/venv.html
+*

@@ -17,15 +17,30 @@ void setup()
     // init steppers
     stepper_init();
 
-    Serial.println("\nGrbl-Plotter-Dummy (PIO) v0.1 Ready");
+    Serial.println("\nGrbl-Plotter-Dummy (PIO) v0.3 Ready (Buffered)");
 }
 
 void loop()
 {
+    stepper_run();
     while (Serial.available())
     {
         char c = Serial.read();
-        if (c == '\n' || c == '\r')
+        if (c == '?')
+        {
+            stepper_report_status();
+        }
+        else if (c == '!')
+        {
+            stepper_hold();
+            Serial.println("[MSG] Paused");
+        }
+        else if (c == '~')
+        {
+            stepper_resume();
+            Serial.println("[MSG] Resumed");
+        }
+        else if (c == '\n' || c == '\r')
         { // end of command line
             if (char_counter > 0)
             {
@@ -46,5 +61,6 @@ void loop()
                 char_counter++;         // increment counter
             }
         }
+        stepper_run();
     }
 }
