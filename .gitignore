@@ -1,0 +1,13 @@
+/test/
+*.cfg
+/lib/
+/lib64/
+/include/
+/bin/
+
+# Tooling
+.vscode/
+.pio/
+
+# Assets
+/vector-graphics/
