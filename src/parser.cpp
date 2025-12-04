@@ -1,15 +1,23 @@
 #include "parser.h"
+#include "stepper.h" // Needed for status reports
 #include <stdlib.h>
 #include <math.h>
+#include <Arduino.h>
+
+// --- SETTINGS ---
+#define ARC_TOLERANCE 0.05
+#define MIN_ARC_SEGMENTS 8
+#define MAX_ARC_SEGMENTS 16
 
 float feed_rate = 1000.0;
-int motion_mode = -1; // 0=G0, 1=G1, 2=G2, 3=G3
+int motion_mode = -1;
 bool absolute_mode = true;
-
 float offset_x = 0.0;
 float offset_y = 0.0;
 
-// REMOVED: #define PI ... (Already defined in Arduino.h)
+#ifndef PI
+#define PI 3.1415926535897932384626433832795
+#endif
 
 void parser_reset_offsets()
 {
@@ -17,214 +25,203 @@ void parser_reset_offsets()
     offset_y = 0.0;
 }
 
-// Helper to handle Arc Interpolation
+// --- NEW: Helper to stay responsive while blocking ---
+void check_realtime_commands()
+{
+    if (Serial.available())
+    {
+        char c = Serial.peek(); // Look without removing yet
+        if (c == '?' || c == '!' || c == '~')
+        {
+            c = Serial.read(); // Now consume it
+            if (c == '?')
+                stepper_report_status();
+            else if (c == '!')
+            {
+                stepper_hold();
+                Serial.println("[MSG] Paused");
+            }
+            else if (c == '~')
+            {
+                stepper_resume();
+                Serial.println("[MSG] Resumed");
+            }
+        }
+    }
+}
+
 void handle_arc(float target_x, float target_y, float offset_i, float offset_j, bool clockwise)
 {
     float current_x, current_y;
     stepper_get_position(&current_x, &current_y);
 
-    // 1. Calculate Center
+    float radius = sqrt(offset_i * offset_i + offset_j * offset_j);
     float center_x = current_x + offset_i;
     float center_y = current_y + offset_j;
 
-    // 2. Calculate Radius
-    float radius = sqrt(offset_i * offset_i + offset_j * offset_j);
+    if (radius < 0.1)
+    {
+        while (!stepper_plan_move(target_x, target_y, feed_rate))
+        {
+            stepper_run();
+            check_realtime_commands(); // <--- KEEP LISTENING
+        }
+        return;
+    }
 
-    // 3. Calculate Angles (in radians)
     float angle_start = atan2(current_y - center_y, current_x - center_x);
     float angle_end = atan2(target_y - center_y, target_x - center_x);
 
-    // 4. Normalize Angles
+    float angular_travel = angle_end - angle_start;
     if (clockwise)
     {
-        if (angle_end >= angle_start)
-            angle_end -= 2.0 * PI;
+        if (angular_travel >= 0)
+            angular_travel -= 2.0 * PI;
     }
     else
     {
-        if (angle_end <= angle_start)
-            angle_end += 2.0 * PI;
+        if (angular_travel <= 0)
+            angular_travel += 2.0 * PI;
     }
 
-    // 5. Determine Segment Count (Resolution)
-    float arc_length = abs(angle_end - angle_start) * radius;
-    int segments = ceil(arc_length * 2.0); // ~0.5mm resolution
+    float mm_per_segment = 2.0 * sqrt(2.0 * radius * ARC_TOLERANCE);
+    float arc_mm = abs(angular_travel * radius);
+    int segments = floor(arc_mm / mm_per_segment);
 
-    // Safety Clamps
-    if (segments < 1)
-        segments = 1;
-    if (segments > 100)
-        segments = 100; // PREVENT FREEZE: Cap segments per arc
+    if (segments < MIN_ARC_SEGMENTS)
+        segments = MIN_ARC_SEGMENTS;
+    if (segments > 32)
+        segments = 32;
 
-    // 6. Interpolate
-    float angle_step = (angle_end - angle_start) / segments;
+    float theta_per_segment = angular_travel / segments;
+    float cos_T = cos(theta_per_segment);
+    float sin_T = sin(theta_per_segment);
 
-    for (int i = 1; i <= segments; i++)
+    float r_ax = -offset_i;
+    float r_ay = -offset_j;
+
+    for (int i = 1; i < segments; i++)
     {
-        float angle = angle_start + i * angle_step;
-        float next_x = center_x + cos(angle) * radius;
-        float next_y = center_y + sin(angle) * radius;
+        float r_nx = r_ax * cos_T - r_ay * sin_T;
+        float r_ny = r_ax * sin_T + r_ay * cos_T;
+        r_ax = r_nx;
+        r_ay = r_ny;
+        float next_x = center_x + r_ax;
+        float next_y = center_y + r_ay;
 
-        // Send linear move for this segment
+        // Block if buffer full, BUT keep checking Serial
         while (!stepper_plan_move(next_x, next_y, feed_rate))
         {
             stepper_run();
+            check_realtime_commands(); // <--- FIX
         }
+    }
+
+    while (!stepper_plan_move(target_x, target_y, feed_rate))
+    {
+        stepper_run();
+        check_realtime_commands(); // <--- FIX
     }
 }
 
 void parse_line(char *line)
 {
     char *ptr = line;
-
-    bool has_x = false;
-    bool has_y = false;
-    // REMOVED: has_i / has_j variables (unused)
-
-    float val_x = 0.0;
-    float val_y = 0.0;
-    float val_i = 0.0;
-    float val_j = 0.0;
+    bool has_x = false, has_y = false;
+    float val_x = 0.0, val_y = 0.0;
+    float val_i = 0.0, val_j = 0.0;
 
     while (*ptr)
     {
-        char c = *ptr;
-
-        // 1. ROBUSTNESS: Skip Whitespace
-        if (c == ' ' || c == '\t' || c == '\r')
-        {
-            ptr++;
+        char c = *ptr++;
+        if (c <= ' ')
             continue;
-        }
-
-        // 2. OPTIMIZATION: Handle Comments Immediately
         if (c == ';' || c == '(')
-        {
             break;
-        }
-
-        // 3. Normalize Case
         if (c >= 'a' && c <= 'z')
             c -= 32;
 
-        // 4. Parse Commands
         if (c == 'G')
         {
-            int cmd = strtol(ptr + 1, &ptr, 10);
-            switch (cmd)
-            {
-            case 0:
+            int cmd = strtol(ptr, &ptr, 10);
+            if (cmd == 0)
                 motion_mode = 0;
-                break;
-            case 1:
+            else if (cmd == 1)
                 motion_mode = 1;
-                break;
-            case 2:
+            else if (cmd == 2)
                 motion_mode = 2;
-                break; // CW Arc
-            case 3:
+            else if (cmd == 3)
                 motion_mode = 3;
-                break; // CCW Arc
-            case 90:
+            else if (cmd == 90)
                 absolute_mode = true;
-                break;
-            case 91:
+            else if (cmd == 91)
                 absolute_mode = false;
-                break;
-            case 92:
+            else if (cmd == 92)
                 motion_mode = 92;
-                break; // Set Position
-            case 21:
-                break; // Units=mm (Default)
-            default:
-                break;
-            }
         }
         else if (c == 'M')
         {
-            int cmd = strtol(ptr + 1, &ptr, 10);
-            switch (cmd)
-            {
-            case 3:
+            int cmd = strtol(ptr, &ptr, 10);
+            if (cmd == 3)
                 pen_down();
-                break;
-            case 5:
+            else if (cmd == 5)
                 pen_up();
-                break;
-            }
         }
         else if (c == 'X')
         {
-            val_x = strtod(ptr + 1, &ptr);
+            val_x = strtod(ptr, &ptr);
             has_x = true;
         }
         else if (c == 'Y')
         {
-            val_y = strtod(ptr + 1, &ptr);
+            val_y = strtod(ptr, &ptr);
             has_y = true;
         }
         else if (c == 'I')
         {
-            val_i = strtod(ptr + 1, &ptr);
-        } // Removed has_i assignment
+            val_i = strtod(ptr, &ptr);
+        }
         else if (c == 'J')
         {
-            val_j = strtod(ptr + 1, &ptr);
-        } // Removed has_j assignment
+            val_j = strtod(ptr, &ptr);
+        }
         else if (c == 'F')
         {
-            feed_rate = strtod(ptr + 1, &ptr);
-        }
-        else
-        {
-            ptr++;
+            feed_rate = strtod(ptr, &ptr);
         }
     }
 
-    // --- Execution ---
-
-    // G92: Set Coordinate System Offset
     if (motion_mode == 92)
     {
-        float current_x, current_y;
-        stepper_get_position(&current_x, &current_y);
-
+        float cx, cy;
+        stepper_get_position(&cx, &cy);
         if (has_x)
-            offset_x = current_x - val_x;
+            offset_x = cx - val_x;
         if (has_y)
-            offset_y = current_y - val_y;
-
+            offset_y = cy - val_y;
         motion_mode = -1;
         return;
     }
 
-    // Move Execution
-    float current_x, current_y;
-    stepper_get_position(&current_x, &current_y);
-    float target_x = current_x;
-    float target_y = current_y;
-
-    if (has_x)
-        target_x = absolute_mode ? val_x + offset_x : current_x + val_x;
-    if (has_y)
-        target_y = absolute_mode ? val_y + offset_y : current_y + val_y;
+    float cx, cy;
+    stepper_get_position(&cx, &cy);
+    float tx = has_x ? (absolute_mode ? val_x + offset_x : cx + val_x) : cx;
+    float ty = has_y ? (absolute_mode ? val_y + offset_y : cy + val_y) : cy;
 
     if (motion_mode == 0 || motion_mode == 1)
     {
-        // Linear Move
-        float move_speed = (motion_mode == 0) ? MAX_FEED_RATE : feed_rate;
-
+        float speed = (motion_mode == 0) ? MAX_FEED_RATE : feed_rate;
         if (has_x || has_y)
         {
-            while (!stepper_plan_move(target_x, target_y, move_speed))
+            while (!stepper_plan_move(tx, ty, speed))
             {
                 stepper_run();
+                check_realtime_commands(); // <--- FIX
             }
         }
     }
     else if (motion_mode == 2 || motion_mode == 3)
     {
-        // Arc Move (G2 / G3)
-        handle_arc(target_x, target_y, val_i, val_j, (motion_mode == 2));
+        handle_arc(tx, ty, val_i, val_j, (motion_mode == 2));
     }
 }

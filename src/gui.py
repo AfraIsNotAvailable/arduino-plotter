@@ -8,15 +8,17 @@ from tkinter import filedialog
 import os
 from svgpathtools import svg2paths, Line, CubicBezier, QuadraticBezier, Arc, Path
 import numpy as np
+import math
+import re
 
 # --- CONFIGURATION ---
-PORT = "/dev/ttyUSB0"  # Check your port!
+PORT = "/dev/ttyUSB0"
 BAUD = 115200
-WINDOW_SIZE = (1000, 650)  # Increased height for input bar
-OFFSET = [
-    250,
-    550,
-]  # Origin (0,0) location on screen (pixels) - Now a list to be mutable
+WINDOW_SIZE = (1000, 650)
+OFFSET = [250, 550]
+FIRMWARE_TIMEOUT = 3600.0
+WATCHDOG_THRESHOLD = 1.0  # Check status every 1.0s if idle
+ARC_RESOLUTION = 0.5
 
 # --- COLORS ---
 COLOR_BG = (20, 20, 30)
@@ -28,7 +30,7 @@ COLOR_BUTTON_HOVER = (80, 80, 100)
 COLOR_PATH = (0, 255, 255)
 COLOR_HEAD = (255, 50, 50)
 COLOR_INPUT_BG = (30, 30, 40)
-COLOR_PEN = (200, 200, 0)  # Gold color for the pen body
+COLOR_PEN = (200, 200, 0)
 
 # --- GLOBAL STATE ---
 current_x = 0.0
@@ -37,23 +39,131 @@ path_points = []
 is_connected = False
 serial_port = None
 console_messages = []
-scale = 5.0  # Pixels per Millimeter (Zoom) - Now global to change it
+scale = 5.0
 
-# Streaming State
 upload_queue = []
 is_uploading = False
 upload_total = 0
 upload_current = 0
 upload_paused = False
+last_cmd_time = 0.0
+last_status_time = 0.0  # New tracker
 
 
-# --- SERIAL THREAD ---
+# --- LINEARIZER ---
+def parse_coords(line):
+    coords = {}
+    for char in ["X", "Y", "Z", "I", "J", "F"]:
+        match = re.search(rf"{char}([-+]?[\d.]+)", line)
+        if match:
+            coords[char] = float(match.group(1))
+    return coords
+
+
+def linearize_arc(start_coords, cmd_coords, clockwise):
+    segments = []
+    x_start, y_start = start_coords.get("X", 0.0), start_coords.get("Y", 0.0)
+    i, j = cmd_coords.get("I", 0.0), cmd_coords.get("J", 0.0)
+    x_center, y_center = x_start + i, y_start + j
+    radius = math.sqrt(i**2 + j**2)
+
+    if radius < 0.001:
+        return []
+
+    angle_start = math.atan2(y_start - y_center, x_start - x_center)
+    x_end = cmd_coords.get("X", x_start)
+    y_end = cmd_coords.get("Y", y_start)
+    angle_end = math.atan2(y_end - y_center, x_end - x_center)
+
+    if clockwise:
+        if angle_end >= angle_start:
+            angle_end -= 2.0 * math.pi
+    else:
+        if angle_end <= angle_start:
+            angle_end += 2.0 * math.pi
+
+    arc_length = abs(angle_end - angle_start) * radius
+    num_segments = int(math.ceil(arc_length / ARC_RESOLUTION))
+    if num_segments < 1:
+        num_segments = 1
+
+    theta_step = (angle_end - angle_start) / num_segments
+
+    for k in range(1, num_segments + 1):
+        theta = angle_start + k * theta_step
+        nx = x_center + radius * math.cos(theta)
+        ny = y_center + radius * math.sin(theta)
+        segments.append(f"G1 X{nx:.4f} Y{ny:.4f}")
+    return segments
+
+
+def run_linearization(input_file, output_file):
+    log_message(f"Linearizing...")
+    try:
+        current_pos = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+        with open(input_file, "r") as f_in, open(output_file, "w") as f_out:
+            for line in f_in:
+                line = line.strip()
+                if (
+                    not line
+                    or line.startswith(";")
+                    or line.startswith("(")
+                    or line.startswith("%")
+                ):
+                    f_out.write(line + "\n")
+                    continue
+                g_match = re.search(r"G(\d+)", line)
+                cmd_type = int(g_match.group(1)) if g_match else -1
+                coords = parse_coords(line)
+                if cmd_type == 2 or cmd_type == 3:
+                    new_lines = linearize_arc(
+                        current_pos, coords, clockwise=(cmd_type == 2)
+                    )
+                    for nl in new_lines:
+                        f_out.write(nl + "\n")
+                        seg_coords = parse_coords(nl)
+                        if "X" in seg_coords:
+                            current_pos["X"] = seg_coords["X"]
+                        if "Y" in seg_coords:
+                            current_pos["Y"] = seg_coords["Y"]
+                else:
+                    f_out.write(line + "\n")
+                    if "X" in coords:
+                        current_pos["X"] = coords["X"]
+                    if "Y" in coords:
+                        current_pos["Y"] = coords["Y"]
+                    if "Z" in coords:
+                        current_pos["Z"] = coords["Z"]
+        log_message("Linearization Done.")
+        return True
+    except Exception as e:
+        log_message(f"Linearize Error: {e}")
+        return False
+
+
+# --- SERIAL LOGIC ---
+def send_next_command():
+    global upload_current, is_uploading, last_cmd_time
+    if upload_current < len(upload_queue):
+        cmd = upload_queue[upload_current]
+        if serial_port and is_connected:
+            serial_port.write(f"{cmd}\n".encode())
+            last_cmd_time = time.perf_counter()
+            if upload_current % 10 == 0 or "G0" in cmd:
+                log_message(f"[{upload_current}/{upload_total}] {cmd}")
+            upload_current += 1
+    else:
+        is_uploading = False
+        log_message("Upload Complete!")
+
+
 def serial_worker():
     global current_x, current_y, is_connected, serial_port
     global is_uploading, upload_current, upload_queue, upload_paused
+    global last_cmd_time, last_status_time
 
     try:
-        s = serial.Serial(PORT, BAUD, timeout=1)
+        s = serial.Serial(PORT, BAUD, timeout=0.1)
         s.write(b"\r\n\r\n")
         time.sleep(2)
         s.reset_input_buffer()
@@ -63,8 +173,23 @@ def serial_worker():
 
         while True:
             if s.isOpen():
-                # Status Request
-                s.write(b"?")
+                now = time.perf_counter()
+
+                # --- HEARTBEAT ---
+                # Check status periodically or if watchdog triggers
+                if (now - last_status_time) > 0.5:
+                    s.write(b"?")
+                    last_status_time = now
+
+                # --- WATCHDOG RECOVERY ---
+                # If uploading but silence for too long, prod it
+                if (
+                    is_uploading
+                    and not upload_paused
+                    and (now - last_cmd_time > WATCHDOG_THRESHOLD)
+                ):
+                    # If we are stuck waiting for 'ok', the '?' above will trigger an 'Idle' or 'Run' response.
+                    pass
 
                 while s.in_waiting:
                     try:
@@ -72,43 +197,36 @@ def serial_worker():
                         if not line:
                             continue
 
-                        if line.startswith("<") and "MPos:" in line:
-                            content = line.strip("<>").split("|")
-                            for item in content:
-                                if item.startswith("MPos:"):
-                                    coords = item.split(":")[1].split(",")
-                                    current_x = float(coords[0])
-                                    current_y = float(coords[1])
+                        if line.startswith("<"):
+                            if "MPos:" in line:
+                                content = line.strip("<>").split("|")
+                                for item in content:
+                                    if item.startswith("MPos:"):
+                                        coords = item.split(":")[1].split(",")
+                                        current_x = float(coords[0])
+                                        current_y = float(coords[1])
+                                        if not path_points or (
+                                            abs(path_points[-1][0] - current_x) > 0.1
+                                            or abs(path_points[-1][1] - current_y) > 0.1
+                                        ):
+                                            path_points.append((current_x, current_y))
 
-                                    if not path_points or (
-                                        abs(path_points[-1][0] - current_x) > 0.1
-                                        or abs(path_points[-1][1] - current_y) > 0.1
-                                    ):
-                                        path_points.append((current_x, current_y))
+                            # RECOVERY: If firmware says "Idle" but we think we are uploading, we lost an 'ok'
+                            if "Idle" in line and is_uploading and not upload_paused:
+                                log_message("[WARN] Watchdog: Recovering lost 'ok'")
+                                send_next_command()
 
-                        elif line == "ok":
+                        elif "ok" in line:
                             if is_uploading and not upload_paused:
-                                if upload_current < len(upload_queue):
-                                    cmd = upload_queue[upload_current]
-                                    s.write(f"{cmd}\n".encode())
-
-                                    if upload_current % 5 == 0:
-                                        log_message(
-                                            f"[{upload_current}/{upload_total}] {cmd}"
-                                        )
-
-                                    upload_current += 1
-                                else:
-                                    is_uploading = False
-                                    log_message("Upload Complete!")
+                                send_next_command()
 
                         elif line != "ok":
-                            log_message(f"> {line}")
+                            pass
 
-                    except Exception:
+                    except Exception as e:
                         pass
 
-            time.sleep(0.02)
+            time.sleep(0.005)
 
     except Exception as e:
         print(f"Serial Error: {e}")
@@ -116,17 +234,20 @@ def serial_worker():
 
 
 def send_gcode(code):
+    global last_cmd_time
     if serial_port and is_connected:
         serial_port.write(f"{code}\n".encode())
+        last_cmd_time = time.perf_counter()
 
 
 def log_message(msg):
+    print(msg)
     console_messages.append(msg)
-    if len(console_messages) > 28:  # Keep only last N messages
+    if len(console_messages) > 28:
         console_messages.pop(0)
 
 
-# Run file dialog in a separate process to avoid Pygame/Tkinter conflicts on Linux
+# --- BOILERPLATE GUI ---
 def open_file_dialog():
     import subprocess
 
@@ -136,15 +257,12 @@ def open_file_dialog():
         "import tkinter as tk; from tkinter import filedialog; root = tk.Tk(); root.withdraw(); print(filedialog.askopenfilename())",
     ]
     try:
-        result = subprocess.check_output(cmd).decode().strip()
-        return result
+        return subprocess.check_output(cmd).decode().strip()
     except:
         return None
 
 
 def clean_gcode_line(line):
-    """Removes comments and whitespace reliably."""
-    # Remove inline comments (everything after ; or ()
     if ";" in line:
         line = line.split(";")[0]
     if "(" in line:
@@ -152,103 +270,47 @@ def clean_gcode_line(line):
     return line.strip()
 
 
-def convert_svg_to_gcode(svg_path):
-    gcode = ["G90", "G21", "M5", "G0 Z5"]
-    try:
-        paths, attributes = svg2paths(svg_path)
-        px_to_mm = 0.264583
-
-        total_paths = len(paths)
-
-        for i, path in enumerate(paths):
-            # Anti-Freeze: Yield to the GUI thread every few paths
-            if i % 5 == 0:
-                time.sleep(0.001)
-
-            start = path.start
-            gcode.append(
-                f"G0 X{start.real * px_to_mm:.3f} Y{start.imag * px_to_mm:.3f}"
-            )
-            gcode.append("M3")
-
-            # Resolution control: Limit segments to avoid massive files
-            length = path.length()
-            num_segments = int(length / 2)
-
-            # Safety clamp: Don't let segments get too high for small details
-            if num_segments < 5:
-                num_segments = 5
-            if num_segments > 200:
-                num_segments = 200
-
-            for j in range(1, num_segments + 1):
-                pt = path.point(j / num_segments)
-                gcode.append(
-                    f"G1 X{pt.real * px_to_mm:.3f} Y{pt.imag * px_to_mm:.3f} F1000"
-                )
-
-            gcode.append("M5")
-
-        gcode.append("G0 X0 Y0")
-        return gcode
-    except Exception as e:
-        log_message(f"SVG Error: {e}")
-        return []
-
-
 def load_file_handler():
-    global upload_queue, is_uploading, upload_total, upload_current, upload_paused
-
-    # 1. Get File Path
+    global upload_queue, is_uploading, upload_total, upload_current, upload_paused, last_cmd_time
     file_path = open_file_dialog()
     if not file_path:
         return
 
-    log_message(f"Loading: {os.path.basename(file_path)}...")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    output_path = os.path.join(script_dir, "output.gcode")
+    log_message(f"Processing: {os.path.basename(file_path)}")
 
-    ext = os.path.splitext(file_path)[1].lower()
+    if not run_linearization(file_path, output_path):
+        log_message("Conversion Failed!")
+        return
+
     commands = []
-
-    # 2. Parse Content
-    if ext == ".svg":
-        commands = convert_svg_to_gcode(file_path)
-    else:
-        try:
-            with open(file_path, "r") as f:
-                raw_lines = f.readlines()
-
-            for line in raw_lines:
+    try:
+        with open(output_path, "r") as f:
+            for line in f.readlines():
                 clean = clean_gcode_line(line)
-                if clean:  # Only add if not empty
+                if clean:
                     commands.append(clean)
+    except Exception as e:
+        log_message(f"Load Error: {e}")
+        return
 
-        except Exception as e:
-            log_message(f"Load Error: {e}")
-            return
-
-    # 3. Queue Commands
     if commands:
         upload_queue = commands
         upload_total = len(commands)
         upload_current = 0
         is_uploading = True
         upload_paused = False
-        log_message(f"Ready: {upload_total} lines.")
-
-        # 4. Kickstart the upload safely
+        log_message(f"Ready: {upload_total} lines (Linearized).")
         if serial_port and is_connected:
-            cmd = upload_queue[0]
-            serial_port.write(f"{cmd}\n".encode())
-            log_message(f"[Start] {cmd}")
-            upload_current += 1
+            send_next_command()
         else:
             log_message("[Error] Not Connected!")
             is_uploading = False
     else:
-        log_message("File empty or invalid.")
+        log_message("File empty.")
 
 
-# --- UI CLASS ---
 class Button:
     def __init__(self, x, y, w, h, text, callback, transparent=False):
         self.rect = pygame.Rect(x, y, w, h)
@@ -263,17 +325,14 @@ class Button:
             pygame.draw.rect(screen, color, self.rect)
             pygame.draw.rect(screen, (100, 100, 120), self.rect, 1)
         else:
-            # Transparent button style (just outline on hover or nothing)
             if self.hovered:
                 s = pygame.Surface((self.rect.width, self.rect.height), pygame.SRCALPHA)
-                s.fill((255, 255, 255, 50))  # Semi-transparent white
+                s.fill((255, 255, 255, 50))
                 screen.blit(s, self.rect.topleft)
                 pygame.draw.rect(screen, (200, 200, 200), self.rect, 1)
-
         text_color = COLOR_TEXT
         if self.transparent and self.hovered:
             text_color = (255, 255, 255)
-
         text_surf = font.render(self.text, True, text_color)
         text_rect = text_surf.get_rect(center=self.rect.center)
         screen.blit(text_surf, text_rect)
@@ -286,7 +345,6 @@ class Button:
                 self.callback()
 
 
-# --- BUTTON CALLBACKS ---
 def btn_load():
     threading.Thread(target=load_file_handler).start()
 
@@ -339,27 +397,14 @@ def btn_zoom_out():
     scale = max(1.0, scale - 1.0)
 
 
-# --- DRAW PEN HELPER ---
 def draw_pen(screen, x, y):
-    # Tip of the pen is at (x, y)
-    # Body is a triangle/rect pointing down
-    # Coordinates relative to tip
-    color = COLOR_HEAD
-    body_color = COLOR_PEN
-
-    # Pen Tip (Triangle)
-    pygame.draw.polygon(screen, color, [(x, y), (x - 5, y - 10), (x + 5, y - 10)])
-
-    # Pen Body (Rectangle)
-    pygame.draw.rect(screen, body_color, (x - 5, y - 35, 10, 25))
-
-    # Shadow/Outline
+    pygame.draw.polygon(screen, COLOR_HEAD, [(x, y), (x - 5, y - 10), (x + 5, y - 10)])
+    pygame.draw.rect(screen, COLOR_PEN, (x - 5, y - 35, 10, 25))
     pygame.draw.line(screen, (0, 0, 0), (x, y), (x - 5, y - 10), 1)
     pygame.draw.line(screen, (0, 0, 0), (x, y), (x + 5, y - 10), 1)
     pygame.draw.rect(screen, (0, 0, 0), (x - 5, y - 35, 10, 25), 1)
 
 
-# --- MAIN UI ---
 def main():
     pygame.init()
     screen = pygame.display.set_mode(WINDOW_SIZE)
@@ -370,11 +415,9 @@ def main():
     zoom_font = pygame.font.SysFont("sans-serif", 24, bold=True)
     input_font = pygame.font.SysFont("monospace", 16)
 
-    # Start Serial Thread
     t = threading.Thread(target=serial_worker, daemon=True)
     t.start()
 
-    # Define Buttons (Right Panel)
     buttons = [
         Button(820, 50, 160, 40, "LOAD FILE", btn_load),
         Button(820, 110, 160, 40, "HOME (0,0)", btn_home),
@@ -385,28 +428,21 @@ def main():
         Button(820, 340, 75, 40, "PEN UP", btn_pen_up),
         Button(905, 340, 75, 40, "PEN DN", btn_pen_down),
     ]
-
-    # Floating Zoom Buttons (Top Right of Viz Area)
     zoom_buttons = [
-        Button(740, 20, 40, 40, "+", btn_zoom_in, transparent=True),
-        Button(740, 70, 40, 40, "-", btn_zoom_out, transparent=True),
+        Button(740, 20, 40, 40, "+", btn_zoom_in, True),
+        Button(740, 70, 40, 40, "-", btn_zoom_out, True),
     ]
 
     user_text = ""
-
     running = True
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-
-            # Button Events
             for btn in buttons:
                 btn.handle_event(event)
             for btn in zoom_buttons:
                 btn.handle_event(event)
-
-            # Keyboard Input for Command Bar
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_RETURN:
                     if user_text:
@@ -421,105 +457,77 @@ def main():
                 else:
                     user_text += event.unicode
 
-        # --- DRAWING ---
         screen.fill(COLOR_BG)
-
-        # 1. Left Panel (Console)
         pygame.draw.rect(screen, COLOR_PANEL, (10, 10, 220, 580))
         pygame.draw.rect(screen, (60, 60, 70), (10, 10, 220, 580), 1)
-
         for i, msg in enumerate(console_messages):
             text_surf = font.render(msg, True, COLOR_TEXT)
-            if text_surf.get_width() > 210:
-                msg = msg[:25] + "..."
-                text_surf = font.render(msg, True, COLOR_TEXT)
             screen.blit(text_surf, (15, 15 + i * 20))
 
-        # 2. Right Panel (Controls)
         pygame.draw.rect(screen, COLOR_PANEL, (800, 10, 190, 580))
         pygame.draw.rect(screen, (60, 60, 70), (800, 10, 190, 580), 1)
-
         for btn in buttons:
             btn.draw(screen, btn_font)
 
-        status_color = (0, 255, 0) if is_connected else (255, 0, 0)
-        conn_text = font.render(
-            f"CONN: {'OK' if is_connected else 'NO'}", True, status_color
+        status = (0, 255, 0) if is_connected else (255, 0, 0)
+        screen.blit(
+            font.render(f"CONN: {'OK' if is_connected else 'NO'}", True, status),
+            (820, 500),
         )
-        pos_text = font.render(f"X: {current_x:.2f}", True, COLOR_TEXT)
-        pos_text2 = font.render(f"Y: {current_y:.2f}", True, COLOR_TEXT)
-        zoom_text = font.render(f"Zoom: {scale:.1f}x", True, COLOR_TEXT)
+        screen.blit(font.render(f"X: {current_x:.2f}", True, COLOR_TEXT), (820, 530))
+        screen.blit(font.render(f"Y: {current_y:.2f}", True, COLOR_TEXT), (820, 550))
+        screen.blit(font.render(f"Zoom: {scale:.1f}x", True, COLOR_TEXT), (820, 570))
 
-        screen.blit(conn_text, (820, 500))
-        screen.blit(pos_text, (820, 530))
-        screen.blit(pos_text2, (820, 550))
-        screen.blit(zoom_text, (820, 570))
-
-        # 3. Center Panel (Visualizer)
         viz_rect = pygame.Rect(240, 10, 550, 580)
         pygame.draw.rect(screen, (15, 15, 20), viz_rect)
         old_clip = screen.get_clip()
         screen.set_clip(viz_rect)
 
-        # Grid Lines
         for i in range(0, 200, 10):
-            start = (OFFSET[0] + i * scale, 0)
-            end = (OFFSET[0] + i * scale, 600)
-            pygame.draw.line(screen, COLOR_GRID, start, end, 1)
+            pygame.draw.line(
+                screen,
+                COLOR_GRID,
+                (OFFSET[0] + i * scale, 0),
+                (OFFSET[0] + i * scale, 600),
+                1,
+            )
+            pygame.draw.line(
+                screen,
+                COLOR_GRID,
+                (0, OFFSET[1] - i * scale),
+                (1000, OFFSET[1] - i * scale),
+                1,
+            )
 
-            start = (0, OFFSET[1] - i * scale)
-            end = (1000, OFFSET[1] - i * scale)
-            pygame.draw.line(screen, COLOR_GRID, start, end, 1)
-
-        # Path
         if len(path_points) > 1:
-            pixel_points = []
-            for pt in path_points:
-                px = OFFSET[0] + (pt[0] * scale)
-                py = OFFSET[1] - (pt[1] * scale)
-                pixel_points.append((px, py))
-            pygame.draw.lines(screen, COLOR_PATH, False, pixel_points, 2)
-
-        # Draw Actual Pen Graphic
-        head_x = int(OFFSET[0] + (current_x * scale))
-        head_y = int(OFFSET[1] - (current_y * scale))
-        draw_pen(screen, head_x, head_y)
-
-        # Floating Zoom Buttons
+            pp = [
+                (OFFSET[0] + p[0] * scale, OFFSET[1] - p[1] * scale)
+                for p in path_points
+            ]
+            pygame.draw.lines(screen, COLOR_PATH, False, pp, 2)
+        draw_pen(
+            screen,
+            int(OFFSET[0] + current_x * scale),
+            int(OFFSET[1] - current_y * scale),
+        )
         for btn in zoom_buttons:
             btn.draw(screen, zoom_font)
 
-        # Upload Progress Bar
         if is_uploading:
-            bar_width = 530
-            progress = upload_current / max(1, upload_total)
-            pygame.draw.rect(screen, (50, 50, 50), (250, 20, bar_width, 10))
-            pygame.draw.rect(screen, (0, 200, 0), (250, 20, bar_width * progress, 10))
+            p = upload_current / max(1, upload_total)
+            pygame.draw.rect(screen, (0, 200, 0), (250, 20, 530 * p, 10))
 
         screen.set_clip(old_clip)
         pygame.draw.rect(screen, (60, 60, 70), viz_rect, 1)
 
-        # 4. Bottom Input Bar
-        input_rect = pygame.Rect(10, 600, 980, 40)
-        pygame.draw.rect(screen, COLOR_INPUT_BG, input_rect)
-        pygame.draw.rect(screen, (60, 60, 70), input_rect, 1)
-
-        input_surface = input_font.render("> " + user_text, True, (255, 255, 255))
-        screen.blit(input_surface, (input_rect.x + 10, input_rect.y + 10))
-
-        if time.time() % 1 > 0.5:
-            cursor_x = input_rect.x + 10 + input_surface.get_width()
-            pygame.draw.line(
-                screen,
-                (255, 255, 255),
-                (cursor_x, input_rect.y + 5),
-                (cursor_x, input_rect.y + 35),
-                2,
-            )
+        in_rect = pygame.Rect(10, 600, 980, 40)
+        pygame.draw.rect(screen, COLOR_INPUT_BG, in_rect)
+        screen.blit(
+            input_font.render("> " + user_text, True, (255, 255, 255)), (20, 610)
+        )
 
         pygame.display.flip()
         clock.tick(60)
-
     pygame.quit()
 
 

@@ -10,14 +10,9 @@ uint8_t char_counter = 0;
 void setup()
 {
     Serial.begin(BAUD_RATE);
-
-    // init pen
     pen_init();
-
-    // init steppers
     stepper_init();
-
-    Serial.println("\nGrbl-Plotter-Dummy (PIO) v0.3 Ready (Buffered)");
+    Serial.println("\nGrbl-Plotter-Echo v0.6 Ready");
 }
 
 void loop()
@@ -26,6 +21,12 @@ void loop()
     while (Serial.available())
     {
         char c = Serial.read();
+
+        // --- DEBUG ECHO ---
+        // Uncomment the next line if you need to verify every byte
+        // Serial.print("[RX]"); Serial.print(c); Serial.print(" ");
+        // ------------------
+
         if (c == '?')
         {
             stepper_report_status();
@@ -41,24 +42,37 @@ void loop()
             Serial.println("[MSG] Resumed");
         }
         else if (c == '\n' || c == '\r')
-        { // end of command line
+        {
+            // End of line
             if (char_counter > 0)
             {
-                line[char_counter] = 0; // null terminated string
+                line[char_counter] = 0;
 
-                parse_line(line); // parse gcode
+                // Execute
+                unsigned long t_start = millis();
+                parse_line(line);
+                unsigned long t_end = millis();
 
-                Serial.println("ok");
-                char_counter = 0; // reset variables
-                line[0] = 0;      // clear buffer
+                Serial.print("ok T:");
+                Serial.println(t_end - t_start);
+
+                char_counter = 0;
+                line[0] = 0;
             }
         }
         else
         {
+            // Normal character
             if (char_counter < LINE_BUFFER_SIZE - 1)
             {
-                line[char_counter] = c; // build the line one character at a time
-                char_counter++;         // increment counter
+                line[char_counter] = c;
+                char_counter++;
+            }
+            else
+            {
+                // Buffer Overflow Protection
+                Serial.println("[ERR] Line Buffer Full!");
+                char_counter = 0; // Reset to avoid deadlock
             }
         }
         stepper_run();
