@@ -17,8 +17,8 @@ BAUD = 115200
 WINDOW_SIZE = (1000, 650)
 OFFSET = [250, 550]
 FIRMWARE_TIMEOUT = 3600.0
-WATCHDOG_THRESHOLD = 1.0  # Check status every 1.0s if idle
-ARC_RESOLUTION = 0.5
+WATCHDOG_THRESHOLD = 1.0
+ARC_RESOLUTION = 0.01
 
 # --- COLORS ---
 COLOR_BG = (20, 20, 30)
@@ -27,15 +27,19 @@ COLOR_GRID = (50, 50, 60)
 COLOR_TEXT = (200, 200, 200)
 COLOR_BUTTON = (60, 60, 80)
 COLOR_BUTTON_HOVER = (80, 80, 100)
-COLOR_PATH = (0, 255, 255)
 COLOR_HEAD = (255, 50, 50)
 COLOR_INPUT_BG = (30, 30, 40)
 COLOR_PEN = (200, 200, 0)
 
+# NEW: State Colors
+COLOR_TRAVEL = (255, 50, 50)  # RED (Pen Up)
+COLOR_DRAW = (50, 255, 255)  # CYAN/BLUE (Pen Down)
+
 # --- GLOBAL STATE ---
 current_x = 0.0
 current_y = 0.0
-path_points = []
+# Path points now store: (x, y, is_pen_down)
+path_segments = []
 is_connected = False
 serial_port = None
 console_messages = []
@@ -47,7 +51,10 @@ upload_total = 0
 upload_current = 0
 upload_paused = False
 last_cmd_time = 0.0
-last_status_time = 0.0  # New tracker
+last_status_time = 0.0
+
+# Track "Virtual" State to color lines correctly
+virtual_pen_down = False
 
 
 # --- LINEARIZER ---
@@ -66,7 +73,6 @@ def linearize_arc(start_coords, cmd_coords, clockwise):
     i, j = cmd_coords.get("I", 0.0), cmd_coords.get("J", 0.0)
     x_center, y_center = x_start + i, y_start + j
     radius = math.sqrt(i**2 + j**2)
-
     if radius < 0.001:
         return []
 
@@ -143,9 +149,24 @@ def run_linearization(input_file, output_file):
 
 # --- SERIAL LOGIC ---
 def send_next_command():
-    global upload_current, is_uploading, last_cmd_time
+    global upload_current, is_uploading, last_cmd_time, virtual_pen_down
     if upload_current < len(upload_queue):
         cmd = upload_queue[upload_current]
+
+        # --- TRACK PEN STATE FOR COLORS ---
+        # We assume negative Z is pen down (cutting)
+        if "Z" in cmd:
+            z_match = re.search(r"Z([-+]?[\d.]+)", cmd)
+            if z_match:
+                z_val = float(z_match.group(1))
+                virtual_pen_down = z_val <= 0
+        # Also check M3 (Down) / M5 (Up) just in case
+        if "M3" in cmd:
+            virtual_pen_down = True
+        if "M5" in cmd:
+            virtual_pen_down = False
+        # ----------------------------------
+
         if serial_port and is_connected:
             serial_port.write(f"{cmd}\n".encode())
             last_cmd_time = time.perf_counter()
@@ -160,7 +181,7 @@ def send_next_command():
 def serial_worker():
     global current_x, current_y, is_connected, serial_port
     global is_uploading, upload_current, upload_queue, upload_paused
-    global last_cmd_time, last_status_time
+    global last_cmd_time, last_status_time, path_segments, virtual_pen_down
 
     try:
         s = serial.Serial(PORT, BAUD, timeout=0.1)
@@ -175,21 +196,10 @@ def serial_worker():
             if s.isOpen():
                 now = time.perf_counter()
 
-                # --- HEARTBEAT ---
-                # Check status periodically or if watchdog triggers
+                # Heartbeat / Watchdog
                 if (now - last_status_time) > 0.5:
                     s.write(b"?")
                     last_status_time = now
-
-                # --- WATCHDOG RECOVERY ---
-                # If uploading but silence for too long, prod it
-                if (
-                    is_uploading
-                    and not upload_paused
-                    and (now - last_cmd_time > WATCHDOG_THRESHOLD)
-                ):
-                    # If we are stuck waiting for 'ok', the '?' above will trigger an 'Idle' or 'Run' response.
-                    pass
 
                 while s.in_waiting:
                     try:
@@ -203,17 +213,22 @@ def serial_worker():
                                 for item in content:
                                     if item.startswith("MPos:"):
                                         coords = item.split(":")[1].split(",")
-                                        current_x = float(coords[0])
-                                        current_y = float(coords[1])
-                                        if not path_points or (
-                                            abs(path_points[-1][0] - current_x) > 0.1
-                                            or abs(path_points[-1][1] - current_y) > 0.1
-                                        ):
-                                            path_points.append((current_x, current_y))
+                                        new_x = float(coords[0])
+                                        new_y = float(coords[1])
 
-                            # RECOVERY: If firmware says "Idle" but we think we are uploading, we lost an 'ok'
+                                        # Only add point if moved significantly
+                                        if not path_segments or (
+                                            abs(path_segments[-1][0] - new_x) > 0.1
+                                            or abs(path_segments[-1][1] - new_y) > 0.1
+                                        ):
+                                            # STORE (X, Y, COLOR_STATE)
+                                            path_segments.append(
+                                                (new_x, new_y, virtual_pen_down)
+                                            )
+                                            current_x, current_y = new_x, new_y
+
                             if "Idle" in line and is_uploading and not upload_paused:
-                                log_message("[WARN] Watchdog: Recovering lost 'ok'")
+                                log_message("[WARN] Watchdog: Recovering...")
                                 send_next_command()
 
                         elif "ok" in line:
@@ -247,7 +262,7 @@ def log_message(msg):
         console_messages.pop(0)
 
 
-# --- BOILERPLATE GUI ---
+# --- GUI BOILERPLATE ---
 def open_file_dialog():
     import subprocess
 
@@ -355,13 +370,13 @@ def btn_home():
 
 
 def btn_clear():
-    path_points.clear()
+    path_segments.clear()
     log_message("Path Cleared")
 
 
 def btn_zero():
     send_gcode("G92 X0 Y0")
-    path_points.clear()
+    path_segments.clear()
     log_message("Zero Set")
 
 
@@ -483,6 +498,7 @@ def main():
         old_clip = screen.get_clip()
         screen.set_clip(viz_rect)
 
+        # Draw Grid
         for i in range(0, 200, 10):
             pygame.draw.line(
                 screen,
@@ -499,12 +515,24 @@ def main():
                 1,
             )
 
-        if len(path_points) > 1:
-            pp = [
-                (OFFSET[0] + p[0] * scale, OFFSET[1] - p[1] * scale)
-                for p in path_points
-            ]
-            pygame.draw.lines(screen, COLOR_PATH, False, pp, 2)
+        # --- DRAW PATH WITH COLOR ---
+        if len(path_segments) > 1:
+            # We iterate through points and draw a line from prev to curr
+            # Optimization: Only draw last 3000 points to prevent lag if necessary
+            points_to_draw = path_segments  # [-3000:]
+
+            for i in range(1, len(points_to_draw)):
+                p1 = points_to_draw[i - 1]
+                p2 = points_to_draw[i]
+
+                # p = (x, y, is_down)
+                start_pos = (OFFSET[0] + p1[0] * scale, OFFSET[1] - p1[1] * scale)
+                end_pos = (OFFSET[0] + p2[0] * scale, OFFSET[1] - p2[1] * scale)
+
+                # Color based on destination state (p2)
+                col = COLOR_DRAW if p2[2] else COLOR_TRAVEL
+                pygame.draw.line(screen, col, start_pos, end_pos, 2)
+
         draw_pen(
             screen,
             int(OFFSET[0] + current_x * scale),

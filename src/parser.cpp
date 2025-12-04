@@ -1,19 +1,26 @@
 #include "parser.h"
-#include "stepper.h" // Needed for status reports
+#include "stepper.h"
 #include <stdlib.h>
 #include <math.h>
 #include <Arduino.h>
 
-// --- SETTINGS ---
 #define ARC_TOLERANCE 0.05
 #define MIN_ARC_SEGMENTS 8
 #define MAX_ARC_SEGMENTS 16
+
+// --- SMOOTHING FIX ---
+// If angle change > 30 degrees, force stop.
+#define CORNER_ANGLE_THRESHOLD 30.0
 
 float feed_rate = 1000.0;
 int motion_mode = -1;
 bool absolute_mode = true;
 float offset_x = 0.0;
 float offset_y = 0.0;
+
+// Track previous move to calculate angle
+float last_move_dx = 0.0;
+float last_move_dy = 0.0;
 
 #ifndef PI
 #define PI 3.1415926535897932384626433832795
@@ -25,15 +32,14 @@ void parser_reset_offsets()
     offset_y = 0.0;
 }
 
-// --- NEW: Helper to stay responsive while blocking ---
 void check_realtime_commands()
 {
     if (Serial.available())
     {
-        char c = Serial.peek(); // Look without removing yet
+        char c = Serial.peek();
         if (c == '?' || c == '!' || c == '~')
         {
-            c = Serial.read(); // Now consume it
+            c = Serial.read();
             if (c == '?')
                 stepper_report_status();
             else if (c == '!')
@@ -50,6 +56,43 @@ void check_realtime_commands()
     }
 }
 
+// Check for sharp corner and pause if needed
+void check_corner(float new_dx, float new_dy)
+{
+    // Calculate angle between vectors
+    // Dot Product: A . B = |A||B|cos(theta)
+    float mag_last = sqrt(last_move_dx * last_move_dx + last_move_dy * last_move_dy);
+    float mag_new = sqrt(new_dx * new_dx + new_dy * new_dy);
+
+    if (mag_last > 0.1 && mag_new > 0.1)
+    {
+        float dot = last_move_dx * new_dx + last_move_dy * new_dy;
+        float cos_theta = dot / (mag_last * mag_new);
+
+        // Clamp for floating point errors
+        if (cos_theta > 1.0)
+            cos_theta = 1.0;
+        if (cos_theta < -1.0)
+            cos_theta = -1.0;
+
+        float angle_rad = acos(cos_theta);
+        float angle_deg = angle_rad * 180.0 / PI;
+
+        if (angle_deg > CORNER_ANGLE_THRESHOLD)
+        {
+            // SHARP CORNER DETECTED!
+            // Wait for buffer to empty (effectively stops motors)
+            while (stepper_is_moving())
+            {
+                stepper_run();
+                check_realtime_commands();
+            }
+        }
+    }
+    last_move_dx = new_dx;
+    last_move_dy = new_dy;
+}
+
 void handle_arc(float target_x, float target_y, float offset_i, float offset_j, bool clockwise)
 {
     float current_x, current_y;
@@ -64,7 +107,7 @@ void handle_arc(float target_x, float target_y, float offset_i, float offset_j, 
         while (!stepper_plan_move(target_x, target_y, feed_rate))
         {
             stepper_run();
-            check_realtime_commands(); // <--- KEEP LISTENING
+            check_realtime_commands();
         }
         return;
     }
@@ -109,18 +152,21 @@ void handle_arc(float target_x, float target_y, float offset_i, float offset_j, 
         float next_x = center_x + r_ax;
         float next_y = center_y + r_ay;
 
-        // Block if buffer full, BUT keep checking Serial
+        // Note: Arcs are naturally smooth, no need to stop inside them.
         while (!stepper_plan_move(next_x, next_y, feed_rate))
         {
             stepper_run();
-            check_realtime_commands(); // <--- FIX
+            check_realtime_commands();
         }
+        // Update vector for corner check
+        last_move_dx = next_x - current_x;
+        last_move_dy = next_y - current_y;
     }
 
     while (!stepper_plan_move(target_x, target_y, feed_rate))
     {
         stepper_run();
-        check_realtime_commands(); // <--- FIX
+        check_realtime_commands();
     }
 }
 
@@ -213,10 +259,15 @@ void parse_line(char *line)
         float speed = (motion_mode == 0) ? MAX_FEED_RATE : feed_rate;
         if (has_x || has_y)
         {
+
+            // --- CORNER CHECK ---
+            check_corner(tx - cx, ty - cy);
+            // --------------------
+
             while (!stepper_plan_move(tx, ty, speed))
             {
                 stepper_run();
-                check_realtime_commands(); // <--- FIX
+                check_realtime_commands();
             }
         }
     }
