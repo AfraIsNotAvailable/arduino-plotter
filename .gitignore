@@ -1,2 +1,11 @@
 # Created by venv; see https://docs.python.org/3/library/venv.html
-
+./test
+*.cfg
+./lib
+./lib64
+./include/site
+./include/python3.13
+./bin
+./.vscode
+./.pio
+./vector-graphics
